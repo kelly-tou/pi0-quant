@@ -70,12 +70,14 @@ from pi0_inout._jax_stubs import inject as _inject_jax_stubs   # noqa: E402
 _inject_jax_stubs()
 
 # ── Now it is safe to import the pytorch model ────────────────────────────────
+import numpy as np
 import torch
 import torch.nn as nn
 
 # ── pi0_inout imports (quantization layer) ────────────────────────────────────
-from pi0_inout.quant_types import QuantFormat
+from pi0_inout.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS
 from pi0_inout.model_patcher import patch_model, list_linear_layers
+from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
 
 
@@ -248,6 +250,152 @@ def _load_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# Norm stats loading (self-contained — no pydantic/numpydantic dependency)
+# ---------------------------------------------------------------------------
+
+def _load_norm_stats(norm_stats_dir: str) -> dict:
+    """Load norm_stats.json and return {key: SimpleNamespace(mean, std, q01, q99)}."""
+    path = Path(norm_stats_dir) / "norm_stats.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Norm stats not found at: {path}")
+    with open(path) as f:
+        data = json.load(f)
+    stats = {}
+    for key, val in data["norm_stats"].items():
+        stats[key] = SimpleNamespace(
+            mean=np.array(val["mean"], dtype=np.float64),
+            std=np.array(val["std"], dtype=np.float64),
+            q01=np.array(val["q01"], dtype=np.float64) if val.get("q01") is not None else None,
+            q99=np.array(val["q99"], dtype=np.float64) if val.get("q99") is not None else None,
+        )
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Post-patch diagnostics
+# ---------------------------------------------------------------------------
+
+def print_quant_diagnostics(
+    model: nn.Module,
+    input_fmt: QuantFormat,
+    output_fmt: QuantFormat,
+) -> None:
+    """
+    Print model structure and memory analysis after quantization patching.
+    Shows that this is SIMULATED quantization (weights stay in original dtype).
+    """
+    print("\n" + "=" * 80)
+    print("QUANTIZATION DIAGNOSTICS")
+    print("=" * 80)
+
+    # 1. Layer inventory: count QuantLinear vs plain nn.Linear
+    n_quant = 0
+    n_plain = 0
+    total_params = 0
+    quant_params = 0
+    sample_layer = None
+
+    for name, module in model.named_modules():
+        if isinstance(module, QuantLinear):
+            n_quant += 1
+            n_params = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
+            quant_params += n_params
+            total_params += n_params
+            if sample_layer is None:
+                sample_layer = (name, module)
+        elif type(module) is nn.Linear:
+            n_plain += 1
+            n_params = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
+            total_params += n_params
+
+    print(f"\n[1] Layer counts:")
+    print(f"    QuantLinear layers: {n_quant}")
+    print(f"    Plain nn.Linear:   {n_plain}")
+    print(f"    Total parameters:  {total_params:,}")
+    print(f"    Quantized params:  {quant_params:,}")
+
+    # 2. Print a few representative QuantLinear layers
+    print(f"\n[2] Sample QuantLinear layers (first 5):")
+    print(f"    {'Name':<60s}  {'Weight dtype':<12s}  input_fmt    output_fmt")
+    print("    " + "-" * 110)
+    count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, QuantLinear):
+            print(f"    {name:<60s}  {str(module.weight.dtype):<12s}  "
+                  f"{module.input_fmt.value:<12s} {module.output_fmt.value}")
+            count += 1
+            if count >= 5:
+                print(f"    ... ({n_quant - 5} more)")
+                break
+
+    # 3. Memory analysis
+    input_bits = FORMAT_BITS[input_fmt]["total"]
+    bf16_bits = 16
+
+    # Actual memory used (weights stay in original dtype)
+    actual_bytes = 0
+    for p in model.parameters():
+        actual_bytes += p.numel() * p.element_size()
+
+    # Hypothetical memory if weights were ACTUALLY stored in input_fmt
+    hypothetical_bytes = 0
+    for name, module in model.named_modules():
+        if isinstance(module, QuantLinear):
+            n = module.weight.numel() + (module.bias.numel() if module.bias is not None else 0)
+            hypothetical_bytes += n * (input_bits // 8)
+        elif type(module) is nn.Linear:
+            for p in module.parameters():
+                hypothetical_bytes += p.numel() * p.element_size()
+    # Add non-linear params at their actual size
+    linear_param_ids = set()
+    for name, module in model.named_modules():
+        if isinstance(module, (QuantLinear, nn.Linear)):
+            for p in module.parameters():
+                linear_param_ids.add(id(p))
+    for p in model.parameters():
+        if id(p) not in linear_param_ids:
+            hypothetical_bytes += p.numel() * p.element_size()
+
+    bf16_bytes = total_params * (bf16_bits // 8)
+
+    print(f"\n[3] Memory analysis:")
+    print(f"    Actual GPU memory (weights in original dtype): {actual_bytes / 1e9:.3f} GB")
+    print(f"    Hypothetical if stored as {input_fmt.value}:   {hypothetical_bytes / 1e9:.3f} GB")
+    print(f"    Reference bf16 size (linear params only):      {bf16_bytes / 1e9:.3f} GB")
+    print(f"    Compression ratio (hypothetical vs bf16):      {bf16_bytes / max(hypothetical_bytes, 1):.2f}x")
+    print(f"    NOTE: Actual memory is UNCHANGED — this is simulated quantization.")
+    print(f"          Weights are stored in {sample_layer[1].weight.dtype if sample_layer else 'N/A'}, "
+          f"cast through {input_fmt.value} at runtime.")
+
+    # 4. Verify quantization actually changes values (pick one weight tensor)
+    if sample_layer is not None:
+        name, layer = sample_layer
+        w = layer.weight.detach().float()
+        target_dtype = TORCH_DTYPE[input_fmt]
+        w_quant = w.to(target_dtype).to(w.dtype)
+        diff = (w - w_quant).abs()
+        n_changed = (diff > 0).sum().item()
+        n_total = w.numel()
+
+        print(f"\n[4] Quantization verification (layer: {name}):")
+        print(f"    Weight shape:        {tuple(w.shape)}")
+        print(f"    Weight dtype:        {layer.weight.dtype}")
+        print(f"    Target quant dtype:  {target_dtype}")
+        print(f"    Values changed:      {n_changed:,} / {n_total:,} "
+              f"({100 * n_changed / n_total:.1f}%)")
+        print(f"    Max abs difference:  {diff.max().item():.6e}")
+        print(f"    Mean abs difference: {diff.mean().item():.6e}")
+        if n_changed == 0 and input_fmt != QuantFormat.FLOAT32:
+            print(f"    WARNING: No values changed! Quantization may not be working.")
+        elif input_fmt == QuantFormat.FLOAT32:
+            print(f"    OK: FLOAT32 passthrough — zero difference expected.")
+        else:
+            print(f"    OK: Quantization is actively rounding values.")
+
+    print("\n" + "=" * 80 + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Policy shim (Pi0PyTorchPolicy)
 # ---------------------------------------------------------------------------
 
@@ -257,35 +405,73 @@ class Pi0PyTorchPolicy:
     WebsocketPolicyServer:
         policy.infer(obs_dict)  → {"actions": np.ndarray}
         policy.metadata         → dict
+
+    Replicates the openpi output transform pipeline:
+        1. Normalize input state
+        2. Model inference
+        3. Unnormalize output actions (and state)
+        4. AbsoluteActions: delta → absolute joint positions (joint-pos configs)
+        5. Slice to first 8 dims (7 joints + 1 gripper)
     """
 
-    def __init__(self, model: nn.Module, device: torch.device) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        device: torch.device,
+        *,
+        norm_stats: dict | None = None,
+        use_quantile_norm: bool = False,
+        is_joint_position: bool = False,
+    ) -> None:
         self.model    = model
         self.device   = device
         self.metadata = {"model": "PI0Pytorch", "quantized": True}
+        self.norm_stats = norm_stats
+        self.use_quantile_norm = use_quantile_norm
+        self.is_joint_position = is_joint_position
+
+    # ── Normalization helpers (mirrors openpi/transforms.py) ──────────────
+
+    def _normalize(self, x: np.ndarray, stats) -> np.ndarray:
+        """Normalize x using norm_stats (truncates stats to x's last dim)."""
+        if self.use_quantile_norm:
+            q01 = stats.q01[..., :x.shape[-1]]
+            q99 = stats.q99[..., :x.shape[-1]]
+            return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        mean = stats.mean[..., :x.shape[-1]]
+        std  = stats.std[..., :x.shape[-1]]
+        return (x - mean) / (std + 1e-6)
+
+    def _unnormalize(self, x: np.ndarray, stats) -> np.ndarray:
+        """Unnormalize x using norm_stats (pads stats to x's last dim)."""
+        if self.use_quantile_norm:
+            q01, q99 = stats.q01, stats.q99
+            dim = q01.shape[-1]
+            if dim < x.shape[-1]:
+                norm_part = (x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+                return np.concatenate([norm_part, x[..., dim:]], axis=-1)
+            return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        # z-score: pad mean with 0, std with 1 for extra dims
+        dim = stats.mean.shape[-1]
+        extra = max(0, x.shape[-1] - dim)
+        mean = np.concatenate([stats.mean, np.zeros(extra)])
+        std  = np.concatenate([stats.std,  np.ones(extra)])
+        return x * (std + 1e-6) + mean
+
+    # ── Inference ─────────────────────────────────────────────────────────
 
     def infer(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Map DROID WebSocket obs dict → PI0Pytorch SimpleNamespace and run inference.
-
-        Client sends:
-          "observation/exterior_image_1_left"  uint8 HWC [224,224,3]  → base_0_rgb
-          "observation/wrist_image_left"        uint8 HWC [224,224,3]  → left_wrist_0_rgb
-          "observation/joint_position"          float [6]
-          "observation/gripper_position"        float [1]
-          "prompt"                              str (ignored — zero tokens)
-
-        right_wrist_0_rgb is not sent by the client; we fill with zeros and mask=False.
+        Map DROID WebSocket obs dict → PI0Pytorch SimpleNamespace and run
+        inference, then apply the full output transform pipeline.
         """
-        import numpy as np
-
         dev = self.device
         dtype = torch.float32
 
         def _img_tensor(arr: np.ndarray) -> torch.Tensor:
-            """uint8 HWC [H,W,3] → float tensor [1,3,H,W] (preprocessing expects CHW)."""
-            t = torch.from_numpy(arr.copy()).to(dev)          # [H,W,3] uint8
-            t = t.permute(2, 0, 1).unsqueeze(0).to(dtype)    # [1,3,H,W]
+            """uint8 HWC [H,W,3] → float tensor [1,3,H,W]."""
+            t = torch.from_numpy(arr.copy()).to(dev)
+            t = t.permute(2, 0, 1).unsqueeze(0).to(dtype)
             return t
 
         H, W = 224, 224
@@ -305,20 +491,26 @@ class Pi0PyTorchPolicy:
             "right_wrist_0_rgb": torch.zeros(1, dtype=torch.bool, device=dev),
         }
 
-        # State: 7-dim robot state (6 joints + 1 gripper) padded to action_dim=32
-        joint = torch.from_numpy(np.array(obs["observation/joint_position"], dtype=np.float32)).to(dev)
-        grip  = torch.from_numpy(np.array(obs["observation/gripper_position"], dtype=np.float32)).to(dev)
-        raw_state = torch.cat([joint.flatten(), grip.flatten()])   # [7]
-        state = torch.zeros(1, 32, dtype=dtype, device=dev)
-        state[0, :raw_state.shape[0]] = raw_state
+        # ── State: concat joint_pos + gripper, normalize, pad to 32 ──────
+        joint = np.array(obs["observation/joint_position"], dtype=np.float32).flatten()
+        grip  = np.array(obs["observation/gripper_position"], dtype=np.float32).flatten()
+        raw_state = np.concatenate([joint, grip])  # (8,)
 
-        # Tokenised prompt: zeros (mask=0 → model ignores language tokens)
+        if self.norm_stats and "state" in self.norm_stats:
+            norm_state = self._normalize(raw_state, self.norm_stats["state"])
+        else:
+            norm_state = raw_state
+
+        state_padded = np.zeros(32, dtype=np.float32)
+        state_padded[:norm_state.shape[0]] = norm_state
+        state = torch.from_numpy(state_padded).unsqueeze(0).to(dev)  # (1, 32)
+
+        # ── Tokenised prompt: zeros (mask=0 → model ignores language) ────
         max_tok = 200
-        tokenized_prompt      = torch.zeros(1, max_tok, dtype=torch.int64,  device=dev)
-        tokenized_prompt_mask = torch.zeros(1, max_tok, dtype=torch.bool,   device=dev)
-
-        token_ar_mask   = torch.zeros(1, max_tok, dtype=torch.bool, device=dev)
-        token_loss_mask = torch.zeros(1, max_tok, dtype=torch.bool, device=dev)
+        tokenized_prompt      = torch.zeros(1, max_tok, dtype=torch.int64, device=dev)
+        tokenized_prompt_mask = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
+        token_ar_mask         = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
+        token_loss_mask       = torch.zeros(1, max_tok, dtype=torch.bool,  device=dev)
 
         obs_ns = SimpleNamespace(
             images=images,
@@ -332,8 +524,22 @@ class Pi0PyTorchPolicy:
 
         with torch.no_grad():
             actions = self.model.sample_actions(str(dev), obs_ns, num_steps=10)
-        # actions: [1, action_horizon=15, action_dim=32] -> slice to 8 (7 joints + 1 gripper)
-        return {"actions": actions.squeeze(0).cpu().numpy()[:, :8]}
+        # actions: [1, action_horizon, 32]  (normalized action space)
+        actions = actions.squeeze(0).cpu().numpy()  # (horizon, 32)
+
+        # ── Output transforms (mirrors openpi pipeline) ───────────────────
+        # 1. Unnormalize actions
+        if self.norm_stats and "actions" in self.norm_stats:
+            actions = self._unnormalize(actions, self.norm_stats["actions"])
+
+        # 2. AbsoluteActions for joint-position configs:
+        #    model outputs delta joint positions → add current state to get absolute
+        #    mask = make_bool_mask(7, -1) = first 7 dims True, last dim (gripper) False
+        if self.is_joint_position:
+            actions[..., :7] += raw_state[:7]
+
+        # 3. Slice to 8 dims (7 joints + 1 gripper)
+        return {"actions": actions[:, :8]}
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +596,9 @@ def main() -> None:
     )
     logger.info(f"Model patched: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}")
 
+    # ── Print quantization diagnostics ────────────────────────────────────
+    print_quant_diagnostics(model, input_fmt, output_fmt)
+
     # ── Register stats dump on exit ───────────────────────────────────────
     def _dump_stats() -> None:
         logger.info("=== Quantization RMSE Report ===")
@@ -405,8 +614,38 @@ def main() -> None:
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
+    # ── Load norm stats ────────────────────────────────────────────────────
+    norm_stats = None
+    if args.norm_stats_dir:
+        norm_stats = _load_norm_stats(args.norm_stats_dir)
+        logger.info(f"Loaded norm stats from {args.norm_stats_dir} "
+                     f"(keys: {list(norm_stats.keys())})")
+    else:
+        # Try checkpoint_dir/assets/droid/ as fallback
+        fallback = Path(args.checkpoint_dir) / "assets" / "droid"
+        if (fallback / "norm_stats.json").exists():
+            norm_stats = _load_norm_stats(str(fallback))
+            logger.info(f"Loaded norm stats from {fallback}")
+        else:
+            logger.warning(
+                "No --norm-stats-dir provided and no norm_stats.json found in "
+                f"{fallback}. Running WITHOUT normalization — actions will be wrong!"
+            )
+
+    cfg = _get_model_config(args.config)
+    use_quantile_norm = getattr(cfg, "pi05", False)
+    is_joint_position = "jointpos" in args.config
+    logger.info(f"use_quantile_norm={use_quantile_norm}  "
+                f"is_joint_position={is_joint_position}")
+
     # ── Build policy and start WebSocket server ───────────────────────────
-    policy = Pi0PyTorchPolicy(model=model, device=device)
+    policy = Pi0PyTorchPolicy(
+        model=model,
+        device=device,
+        norm_stats=norm_stats,
+        use_quantile_norm=use_quantile_norm,
+        is_joint_position=is_joint_position,
+    )
 
     from openpi.serving import websocket_policy_server
     import socket
@@ -436,6 +675,9 @@ def parse_args() -> argparse.Namespace:
                    help="Training config name (used to look up architecture params)")
     p.add_argument("--checkpoint-dir", default="",
                    help="Directory containing model.safetensors (or gs:// path with a warning)")
+    p.add_argument("--norm-stats-dir", default=None,
+                   help="Directory containing norm_stats.json "
+                        "(default: tries <checkpoint-dir>/assets/droid/)")
     p.add_argument("--port",  type=int, default=8003)
     p.add_argument("--gpu",   type=int, default=0,
                    help="CUDA device index (-1 for CPU)")
