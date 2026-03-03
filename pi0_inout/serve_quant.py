@@ -731,9 +731,9 @@ def parse_args() -> argparse.Namespace:
                    help="CUDA device index (-1 for CPU)")
 
     # Quantization
-    p.add_argument("--input-fmt",  default="float32",
+    p.add_argument("--input-fmt",  default="bfloat16",
                    choices=[f.value for f in QuantFormat])
-    p.add_argument("--output-fmt", default="float32",
+    p.add_argument("--output-fmt", default="bfloat16",
                    choices=[f.value for f in QuantFormat])
 
     # Output
