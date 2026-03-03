@@ -19,8 +19,8 @@ from memory in input_fmt.  The float32 accumulator holds the running sum
 throughout.  The single output quantization to B happens once, on the final
 accumulated result including the bias.
 
-FLOAT32 input_fmt and output_fmt are identity operations (no rounding).
-A FLOAT32/FLOAT32 run has exactly zero quantization RMSE.
+BFLOAT16 input_fmt and output_fmt are identity operations for bf16 models.
+A BFLOAT16/BFLOAT16 run has exactly zero quantization RMSE.
 """
 
 from __future__ import annotations

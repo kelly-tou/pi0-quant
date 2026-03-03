@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # Format combinations
 # ---------------------------------------------------------------------------
 
-ALL_FORMATS = ["float32", "float16", "bfloat16", "float8_e4m3", "float8_e5m2"]
+ALL_FORMATS = ["bfloat16", "float16", "float8_e4m3", "float8_e5m2"]
 
 
 def format_pairs(input_fmts: list[str], output_fmts: list[str]) -> list[tuple[str, str]]:
