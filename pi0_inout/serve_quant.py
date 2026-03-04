@@ -76,7 +76,11 @@ import torch.nn as nn
 
 # ── pi0_inout imports (quantization layer) ────────────────────────────────────
 from pi0_inout.quant_types import QuantFormat, TORCH_DTYPE, FORMAT_BITS
-from pi0_inout.model_patcher import patch_model, list_linear_layers
+from pi0_inout.model_patcher import (
+    patch_model, list_linear_layers,
+    QuantGroup, ALL_GROUPS,
+    patch_attn_sdpa, unpatch_attn_sdpa,
+)
 from pi0_inout.quant_linear import QuantLinear
 from pi0_inout.stats_tracker import StatsTracker
 
@@ -629,21 +633,35 @@ def main() -> None:
     input_fmt  = QuantFormat(args.input_fmt)
     output_fmt = QuantFormat(args.output_fmt)
 
+    active_groups = {QuantGroup(g) for g in args.quantize_components}
+
     tracker = StatsTracker()
     patch_model(
         model=model,
         input_fmt=input_fmt,
         output_fmt=output_fmt,
         tracker=tracker,
+        active_groups=active_groups,
         verbose=False,
     )
-    logger.info(f"Model patched: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}")
+    attn_handles = patch_attn_sdpa(
+        model=model,
+        active_groups=active_groups,
+        input_fmt=input_fmt,
+        output_fmt=output_fmt,
+        tracker=tracker,
+    )
+    logger.info(
+        f"Model patched: input_fmt={input_fmt.value}  output_fmt={output_fmt.value}  "
+        f"components={args.quantize_components}"
+    )
 
     # ── Print quantization diagnostics ────────────────────────────────────
     print_quant_diagnostics(model, input_fmt, output_fmt)
 
     # ── Register stats dump on exit ───────────────────────────────────────
     def _dump_stats() -> None:
+        unpatch_attn_sdpa(attn_handles)
         logger.info("=== Quantization RMSE Report ===")
         report = tracker.summary()
         report.print(show_layers=False)
@@ -735,6 +753,21 @@ def parse_args() -> argparse.Namespace:
                    choices=[f.value for f in QuantFormat])
     p.add_argument("--output-fmt", default="bfloat16",
                    choices=[f.value for f in QuantFormat])
+    p.add_argument(
+        "--quantize-components",
+        nargs="+",
+        default=[g.value for g in ALL_GROUPS],
+        choices=[g.value for g in ALL_GROUPS],
+        metavar="COMPONENT",
+        help=(
+            "Which model components to quantize (default: all three). "
+            "Choices: vision  transformer  action_head. "
+            "  vision      — SigLIP ViT encoder "
+            "  transformer — PaliGemma LM + action expert (co-attention coupled) "
+            "  action_head — action/state/time projection MLPs "
+            "Example: --quantize-components transformer action_head"
+        ),
+    )
 
     # Output
     p.add_argument("--stats-output", default=None,

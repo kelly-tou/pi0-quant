@@ -30,7 +30,12 @@ Quick start:
 
 from .quant_types   import QuantFormat, quant, TORCH_DTYPE, FORMAT_BITS, all_formats, sweep_pairs
 from .quant_linear  import QuantLinear
-from .model_patcher import patch_model, unpatch_model, count_layers, list_linear_layers, QuantAttnContext
+from .model_patcher import (
+    patch_model, unpatch_model, count_layers, list_linear_layers,
+    QuantAttnContext,
+    QuantGroup, ALL_GROUPS,
+    patch_attn_sdpa, unpatch_attn_sdpa,
+)
 from .stats_tracker import StatsTracker, Component, StatsReport
 from .eval_harness  import (
     QuantConfig,
@@ -58,6 +63,10 @@ __all__ = [
     "count_layers",
     "list_linear_layers",
     "QuantAttnContext",
+    "QuantGroup",
+    "ALL_GROUPS",
+    "patch_attn_sdpa",
+    "unpatch_attn_sdpa",
     # Stats
     "StatsTracker",
     "Component",

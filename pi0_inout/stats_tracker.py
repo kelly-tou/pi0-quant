@@ -55,10 +55,12 @@ class LayerStats:
     in_features: int
     out_features: int
 
-    # Internal Welford accumulators
+    # Internal Welford accumulators — error
     _n: int   = field(default=0, repr=False)
     _mean_mse: float = field(default=0.0, repr=False)
     _M2: float = field(default=0.0, repr=False)  # for variance across calls
+    # Welford accumulator — fp32 reference scale (for relative RMSE)
+    _mean_fp_ms: float = field(default=0.0, repr=False)
 
     def update(self, y_fp: torch.Tensor, y_quant: torch.Tensor) -> None:
         """
@@ -67,17 +69,24 @@ class LayerStats:
         We compute MSE over the full output tensor (all batch elements, all
         sequence positions, all output features), then treat that scalar as
         one new observation for Welford's running mean/variance.
+        Also tracks mean-square of y_fp for relative RMSE denominator.
         """
         with torch.no_grad():
-            diff = y_fp.float() - y_quant.float()
-            mse = diff.pow(2).mean().item()
+            y_fp_f = y_fp.float()
+            diff    = y_fp_f - y_quant.float()
+            mse     = diff.pow(2).mean().item()
+            fp_ms   = y_fp_f.pow(2).mean().item()  # scale of fp32 reference
 
-        # Welford's online update
+        # Welford update — error
         self._n += 1
         delta = mse - self._mean_mse
         self._mean_mse += delta / self._n
         delta2 = mse - self._mean_mse
         self._M2 += delta * delta2
+
+        # Welford update — fp32 scale (same counter)
+        delta_fp = fp_ms - self._mean_fp_ms
+        self._mean_fp_ms += delta_fp / self._n
 
     @property
     def n_calls(self) -> int:
@@ -89,6 +98,20 @@ class LayerStats:
         if self._n == 0:
             return float("nan")
         return math.sqrt(max(self._mean_mse, 0.0))
+
+    @property
+    def rel_rmse(self) -> float:
+        """
+        Relative RMSE: rmse / rms(y_fp32).
+
+        Normalises by the typical magnitude of the fp32 activations so that
+        values from layers with different output scales are comparable.
+        A value of 0.01 means the quantization error is 1% of the activation RMS.
+        Returns nan if no calls recorded or fp32 output is all-zero.
+        """
+        if self._n == 0 or self._mean_fp_ms <= 0:
+            return float("nan")
+        return math.sqrt(max(self._mean_mse, 0.0) / self._mean_fp_ms)
 
     @property
     def mse(self) -> float:
@@ -111,6 +134,7 @@ class LayerStats:
             "out_features": self.out_features,
             "n_calls":      self._n,
             "rmse":         self.rmse,
+            "rel_rmse":     self.rel_rmse,
             "mse":          self.mse,
             "mse_std":      self.mse_std,
         }
@@ -124,21 +148,23 @@ class LayerStats:
 class ComponentStats:
     component: Component
     n_layers: int
-    mean_rmse: float   # mean of per-layer RMSE values
-    std_rmse: float    # std of per-layer RMSE values
+    mean_rmse: float      # mean of per-layer absolute RMSE
+    std_rmse: float
     max_rmse: float
     min_rmse: float
-    total_calls: int   # sum of n_calls across all layers in this component
+    mean_rel_rmse: float  # mean of per-layer relative RMSE (rmse / rms_fp32)
+    total_calls: int
 
     def to_dict(self) -> dict:
         return {
-            "component":   self.component.value,
-            "n_layers":    self.n_layers,
-            "mean_rmse":   self.mean_rmse,
-            "std_rmse":    self.std_rmse,
-            "max_rmse":    self.max_rmse,
-            "min_rmse":    self.min_rmse,
-            "total_calls": self.total_calls,
+            "component":    self.component.value,
+            "n_layers":     self.n_layers,
+            "mean_rmse":    self.mean_rmse,
+            "std_rmse":     self.std_rmse,
+            "max_rmse":     self.max_rmse,
+            "min_rmse":     self.min_rmse,
+            "mean_rel_rmse": self.mean_rel_rmse,
+            "total_calls":  self.total_calls,
         }
 
 
@@ -202,6 +228,7 @@ class StatsTracker:
             stats._n = 0
             stats._mean_mse = 0.0
             stats._M2 = 0.0
+            stats._mean_fp_ms = 0.0
 
     def layer_rows(self) -> List[dict]:
         """Return a list of dicts (one per layer), sorted by component then name."""
@@ -221,7 +248,8 @@ class StatsTracker:
             layers = by_component.get(comp, [])
             if not layers:
                 continue
-            rmse_values = [s.rmse for s in layers if not math.isnan(s.rmse)]
+            rmse_values     = [s.rmse     for s in layers if not math.isnan(s.rmse)]
+            rel_rmse_values = [s.rel_rmse for s in layers if not math.isnan(s.rel_rmse)]
             if not rmse_values:
                 continue
             rows.append(ComponentStats(
@@ -231,6 +259,7 @@ class StatsTracker:
                 std_rmse=_safe_std(rmse_values),
                 max_rmse=max(rmse_values),
                 min_rmse=min(rmse_values),
+                mean_rel_rmse=_safe_mean(rel_rmse_values),
                 total_calls=sum(s.n_calls for s in layers),
             ).to_dict())
         return rows

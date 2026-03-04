@@ -11,41 +11,56 @@ Two patching systems for Pi0Pytorch:
      • FFN gate_proj / up_proj / down_proj in every transformer layer
      • Action head projections (action_in_proj, action_out_proj, etc.)
 
-2. Attention score patching (QuantAttnContext)
-   ──────────────────────────────────────────────
+   pass active_groups to restrict which components are quantized:
+       patch_model(model, ..., active_groups={QuantGroup.VISION, QuantGroup.TRANSFORMER})
+
+2. Attention score patching (patch_attn_sdpa / unpatch_attn_sdpa)
+   ──────────────────────────────────────────────────────────────────
    The attention score matmuls (Q@K^T and attn_weights@V) are NOT nn.Linear
    layers.  HuggingFace computes them inside a single fused kernel:
    F.scaled_dot_product_attention(Q, K, V, ...).
 
-   QuantAttnContext is a context manager that temporarily replaces
-   F.scaled_dot_product_attention with a quantized version.  While active,
-   every SDPA call quantizes Q, K, V to input_fmt before calling the original
-   kernel, and quantizes the output to output_fmt.
-
-   Because SDPA fuses Q@K^T and attn_weights@V into one call, we cannot
-   separately quantize the intermediate attention score matrix.  We can only
-   quantize the inputs (Q, K, V) and the final output.  This is still
-   meaningful — it tests what happens when the data flowing into the attention
-   score computation is at reduced precision.
+   patch_attn_sdpa registers forward hooks on every self_attn module in the
+   active groups so that F.scaled_dot_product_attention is only quantized
+   when called from a module belonging to one of those groups.  Because
+   LANGUAGE and ACTION_EXPERT are co-attention coupled (their layers are
+   interleaved inside a single paligemma_with_expert forward pass), they are
+   grouped together as QuantGroup.TRANSFORMER.
 
    Usage:
-       with QuantAttnContext(QuantFormat.FLOAT8_E4M3, QuantFormat.FLOAT16,
-                             tracker=tracker):
-           actions = model.sample_actions(obs)
+       active = {QuantGroup.TRANSFORMER, QuantGroup.ACTION_HEAD}
+       patch_model(model, input_fmt=..., output_fmt=..., active_groups=active)
+       handles = patch_attn_sdpa(model, active_groups=active, ...)
+       # run inference ...
+       unpatch_attn_sdpa(handles)
+
+   Note: patch_attn_sdpa and QuantAttnContext (the legacy global context
+   manager) patch the same F.scaled_dot_product_attention slot and must not
+   be used simultaneously.
+
+QuantGroup — hardware-realistic ablation boundaries
+----------------------------------------------------
+  VISION      SigLIP ViT — fully independent forward pass; cleanly separable
+              on chip from the joint transformer block.
+  TRANSFORMER PaliGemma language model + Gemma action expert — co-attention
+              couples them at the layer level; on real silicon these would
+              share a compute engine and precision decision.
+  ACTION_HEAD Thin input/output projection MLPs (action_in_proj, action_out_proj,
+              state_proj, time_mlp_*); runs after the joint pass, no attention.
 
 Component tagging for Pi0Pytorch
 ---------------------------------
   PI0Pytorch
   ├── paligemma_with_expert
   │   ├── paligemma
-  │   │   ├── vision_tower      → VISION
-  │   │   └── language_model    → LANGUAGE
-  │   └── gemma_expert          → ACTION_EXPERT
-  ├── action_in_proj            → ACTION_HEAD
-  ├── action_out_proj           → ACTION_HEAD
-  ├── state_proj                → ACTION_HEAD
-  ├── action_time_mlp_{in,out}  → ACTION_HEAD
-  └── time_mlp_{in,out}         → ACTION_HEAD
+  │   │   ├── vision_tower      → VISION       → QuantGroup.VISION
+  │   │   └── language_model    → LANGUAGE     → QuantGroup.TRANSFORMER
+  │   └── gemma_expert          → ACTION_EXPERT → QuantGroup.TRANSFORMER
+  ├── action_in_proj            → ACTION_HEAD  → QuantGroup.ACTION_HEAD
+  ├── action_out_proj           → ACTION_HEAD  → QuantGroup.ACTION_HEAD
+  ├── state_proj                → ACTION_HEAD  → QuantGroup.ACTION_HEAD
+  ├── action_time_mlp_{in,out}  → ACTION_HEAD  → QuantGroup.ACTION_HEAD
+  └── time_mlp_{in,out}         → ACTION_HEAD  → QuantGroup.ACTION_HEAD
 
 Tagging rules are checked in order; first match wins.
 """
@@ -53,6 +68,8 @@ Tagging rules are checked in order; first match wins.
 from __future__ import annotations
 
 import contextlib
+import threading
+from enum import Enum
 from typing import Optional
 
 import torch
@@ -107,6 +124,34 @@ def _infer_component(path: str) -> Component:
 
 
 # ---------------------------------------------------------------------------
+# QuantGroup — hardware-realistic three-way ablation grouping
+# ---------------------------------------------------------------------------
+
+class QuantGroup(str, Enum):
+    VISION      = "vision"       # SigLIP ViT — independent, cleanly separable
+    TRANSFORMER = "transformer"  # PaliGemma LM + action expert — co-attention coupled
+    ACTION_HEAD = "action_head"  # Thin MLPs at Pi0 root — no attention
+
+
+# Maps each QuantGroup to the fine-grained Components it covers.
+_GROUP_TO_COMPONENTS: dict[QuantGroup, frozenset[Component]] = {
+    QuantGroup.VISION:      frozenset({Component.VISION}),
+    QuantGroup.TRANSFORMER: frozenset({Component.LANGUAGE, Component.ACTION_EXPERT}),
+    QuantGroup.ACTION_HEAD: frozenset({Component.ACTION_HEAD}),
+}
+
+ALL_GROUPS: list[QuantGroup] = list(QuantGroup)
+
+
+def _active_components(active_groups: set[QuantGroup]) -> set[Component]:
+    """Return the set of Components covered by the given groups."""
+    result: set[Component] = set()
+    for g in active_groups:
+        result |= _GROUP_TO_COMPONENTS[g]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main patching entry point
 # ---------------------------------------------------------------------------
 
@@ -115,7 +160,7 @@ def patch_model(
     input_fmt: QuantFormat,
     output_fmt: QuantFormat,
     tracker: Optional[StatsTracker] = None,
-    skip_components: Optional[set[Component]] = None,
+    active_groups: Optional[set[QuantGroup]] = None,
     verbose: bool = False,
 ) -> nn.Module:
     """
@@ -124,19 +169,24 @@ def patch_model(
     The model is modified in-place and also returned for convenience.
 
     Args:
-        model:           The Pi0Pytorch model (or any nn.Module).
-        input_fmt:       QuantFormat applied to activation + weight before the matmul.
-        output_fmt:      QuantFormat applied to the matmul output.
-        tracker:         Optional StatsTracker.  If provided, each QuantLinear
-                         will compute RMSE against fp32 and report to the tracker.
-        skip_components: Set of Components whose layers should NOT be quantized
-                         (useful for ablations, e.g. skipping vision).
-        verbose:         If True, print each replaced layer.
+        model:         The Pi0Pytorch model (or any nn.Module).
+        input_fmt:     QuantFormat applied to activation + weight before the matmul.
+        output_fmt:    QuantFormat applied to the matmul output.
+        tracker:       Optional StatsTracker.  If provided, each QuantLinear
+                       will compute RMSE against fp32 and report to the tracker.
+        active_groups: Which QuantGroups to quantize.  None means all three
+                       (VISION + TRANSFORMER + ACTION_HEAD).  Pass a subset
+                       to restrict quantization to those groups only, e.g.:
+                           active_groups={QuantGroup.TRANSFORMER}
+        verbose:       If True, print each replaced layer.
 
     Returns:
         The modified model (same object).
     """
-    skip_components = skip_components or set()
+    if active_groups is None:
+        skip_components: set[Component] = set()
+    else:
+        skip_components = set(Component) - _active_components(active_groups)
     n_replaced = 0
     n_skipped  = 0
 
@@ -288,44 +338,130 @@ def list_linear_layers(model: nn.Module) -> list[dict]:
 # The original unpatched function, saved at import time.
 _orig_sdpa = F.scaled_dot_product_attention
 
+# Thread-local used by patch_attn_sdpa hooks to signal which Component's
+# self_attn is currently executing, so the patched SDPA can gate by group.
+_attn_component_local: threading.local = threading.local()
+
+
+def patch_attn_sdpa(
+    model: nn.Module,
+    active_groups: set[QuantGroup],
+    input_fmt: QuantFormat,
+    output_fmt: QuantFormat,
+    tracker: Optional[StatsTracker] = None,
+) -> list:
+    """
+    Patch F.scaled_dot_product_attention to quantize only SDPA calls that
+    originate from self_attn modules belonging to active_groups.
+
+    Works by registering pre/post forward hooks on every self_attn module
+    in the active groups' subtrees.  The pre-hook sets a thread-local flag
+    to the module's Component; the patched SDPA reads it and quantizes only
+    when that component belongs to an active group.  The post-hook clears
+    the flag.
+
+    This correctly handles LANGUAGE + ACTION_EXPERT co-attention: because
+    both belong to QuantGroup.TRANSFORMER, their interleaved SDPA calls are
+    all captured, even though their layers run inside a single joint forward.
+
+    Args:
+        model:         The (already patch_model'd) Pi0Pytorch model.
+        active_groups: Groups whose SDPA calls should be quantized.
+        input_fmt:     Format for Q, K, V entering SDPA.
+        output_fmt:    Format for the attended output.
+        tracker:       Optional StatsTracker.
+
+    Returns:
+        List of hook handles — pass to unpatch_attn_sdpa() to clean up.
+
+    Note: Do not use simultaneously with QuantAttnContext; both patch the
+    same F.scaled_dot_product_attention slot.
+    """
+    active_groups = set(active_groups)
+    active_comps  = _active_components(active_groups)
+    handles: list = []
+    call_count    = [0]
+
+    # Register pre/post hooks on every self_attn module in the active subtrees.
+    for name, module in model.named_modules():
+        if name.split(".")[-1] != "self_attn":
+            continue
+        comp = _infer_component(name)
+        if comp not in active_comps:
+            continue
+
+        def _make_hooks(c: Component):
+            def pre(mod, inp):
+                _attn_component_local.component = c
+            def post(mod, inp, out):
+                _attn_component_local.component = None
+            return pre, post
+
+        pre_h, post_h = _make_hooks(comp)
+        handles.append(module.register_forward_pre_hook(pre_h))
+        handles.append(module.register_forward_hook(post_h))
+
+    # Patch F.scaled_dot_product_attention globally with a group-aware version.
+    def _quant_sdpa(
+        query, key, value,
+        attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
+    ):
+        current_comp = getattr(_attn_component_local, "component", None)
+        if current_comp is None or current_comp not in active_comps:
+            return _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
+
+        q_q = quant(query.float(), input_fmt).to(query.dtype)
+        k_q = quant(key.float(),   input_fmt).to(key.dtype)
+        v_q = quant(value.float(), input_fmt).to(value.dtype)
+        out = _orig_sdpa(q_q, k_q, v_q, attn_mask, dropout_p, is_causal, scale=scale)
+        out_q = quant(out.float(), output_fmt).to(out.dtype)
+
+        if tracker is not None:
+            with torch.no_grad():
+                out_fp = _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
+                call_count[0] += 1
+                tracker.record(
+                    name=f"sdpa.{current_comp.value}.{call_count[0]}",
+                    component=current_comp,
+                    y_fp=out_fp,
+                    y_quant=out_q,
+                )
+
+        return out_q
+
+    F.scaled_dot_product_attention = _quant_sdpa
+
+    n_modules = len(handles) // 2
+    print(
+        f"[patch_attn_sdpa] Hooked {n_modules} self_attn modules "
+        f"for groups: {[g.value for g in active_groups]}  "
+        f"input_fmt={input_fmt.value}  output_fmt={output_fmt.value}"
+    )
+    return handles
+
+
+def unpatch_attn_sdpa(handles: list) -> None:
+    """
+    Remove hooks registered by patch_attn_sdpa and restore the original
+    F.scaled_dot_product_attention.
+    """
+    for h in handles:
+        h.remove()
+    F.scaled_dot_product_attention = _orig_sdpa
+    print(f"[unpatch_attn_sdpa] Removed {len(handles)} hooks, restored original SDPA.")
+
 
 class QuantAttnContext:
     """
-    Context manager that quantizes the inputs and output of every
-    F.scaled_dot_product_attention call while active.
+    Legacy context manager: quantizes ALL F.scaled_dot_product_attention
+    calls globally while active (no group filtering).
 
-    HuggingFace Gemma and SigLIP route all attention score computation
-    through this single function, which internally computes:
-        scores    = Q @ K^T / sqrt(d_head)   [+ optional mask]
-        weights   = softmax(scores)
-        output    = weights @ V
-
-    These three steps are fused — we cannot quantize the intermediate
-    attention score matrix separately.  What we CAN do:
-        • quantize Q, K, V to input_fmt before the kernel runs
-        • quantize the attended output to output_fmt after
-
-    This covers the format effect on both inner matmuls from the outside.
-
-    Args:
-        input_fmt:  Format for Q, K, V tensors entering SDPA.
-        output_fmt: Format for the attended output leaving SDPA.
-        tracker:    Optional StatsTracker.  If given, records RMSE between
-                    the full-precision and quantized SDPA outputs, keyed as
-                    "sdpa.<component>" where component is inferred from a
-                    thread-local set by the enclosing module hooks (advanced).
-                    In simple usage, all SDPA calls are keyed as "sdpa".
+    Prefer patch_attn_sdpa / unpatch_attn_sdpa for new code, which
+    restricts quantization to specific QuantGroups via module hooks.
 
     Usage:
-        # Patch nn.Linear layers permanently with patch_model(), then wrap
-        # each forward pass in QuantAttnContext for attention score quantization.
-        patch_model(model, input_fmt=..., output_fmt=..., tracker=tracker)
-
-        with QuantAttnContext(QuantFormat.FLOAT8_E4M3, QuantFormat.FLOAT16,
-                              tracker=tracker):
+        with QuantAttnContext(QuantFormat.FLOAT8_E4M3, QuantFormat.FLOAT16):
             actions = model.sample_actions(obs)
-
-        report = tracker.summary()
     """
 
     def __init__(
@@ -334,44 +470,37 @@ class QuantAttnContext:
         output_fmt: QuantFormat,
         tracker: Optional[StatsTracker] = None,
     ) -> None:
-        self.input_fmt  = input_fmt
-        self.output_fmt = output_fmt
-        self.tracker    = tracker
-        self._call_count = 0  # used as a tie-breaker key in stats
+        self.input_fmt   = input_fmt
+        self.output_fmt  = output_fmt
+        self.tracker     = tracker
+        self._call_count = 0
 
     def __enter__(self) -> "QuantAttnContext":
         input_fmt  = self.input_fmt
         output_fmt = self.output_fmt
         tracker    = self.tracker
-        ctx        = self  # closure reference
+        ctx        = self
 
         def _quant_sdpa(
             query, key, value,
             attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
         ):
-            # Quantize Q, K, V to input_fmt
             q_q = quant(query.float(), input_fmt).to(query.dtype)
             k_q = quant(key.float(),   input_fmt).to(key.dtype)
             v_q = quant(value.float(), input_fmt).to(value.dtype)
-
-            # Run the original SDPA with quantized inputs
-            out = _orig_sdpa(q_q, k_q, v_q, attn_mask, dropout_p, is_causal, scale)
-
-            # Quantize the output to output_fmt
+            out = _orig_sdpa(q_q, k_q, v_q, attn_mask, dropout_p, is_causal, scale=scale)
             out_q = quant(out.float(), output_fmt).to(out.dtype)
 
-            # RMSE tracking (optional)
             if tracker is not None:
                 with torch.no_grad():
-                    out_fp = _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale)
+                    out_fp = _orig_sdpa(query, key, value, attn_mask, dropout_p, is_causal, scale=scale)
                     ctx._call_count += 1
                     tracker.record(
                         name=f"sdpa.{ctx._call_count}",
-                        component=Component.UNKNOWN,  # can't infer without module hooks
+                        component=Component.UNKNOWN,
                         y_fp=out_fp,
                         y_quant=out_q,
                     )
-
             return out_q
 
         F.scaled_dot_product_attention = _quant_sdpa
