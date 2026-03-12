@@ -151,81 +151,100 @@ class AtlasLinearRTLFunction:
         b2 = b_q.float() if b_q is not None else None
 
         batch = x2.shape[0]
-        y = torch.zeros(batch, out_features, dtype=torch.float32, device=x_q.device)
+        device = x_q.device
 
         vec_len = self.p.vecLen
         num_lanes = self.p.numLanes
+        num_k_tiles = math.ceil(in_features / vec_len)
 
-        # Quantize to the exact memory formats the RTL expects
-        x_e4m3 = float_to_e4m3_bytes(x2)            # [B, K]
-        w_e4m3 = float_to_e4m3_bytes(w2)            # [O, K]
+        # Quantize once
+        x_e4m3 = float_to_e4m3_bytes(x2)
+        w_e4m3 = float_to_e4m3_bytes(w2)
         b_e4m3 = float_to_e4m3_bytes(b2) if b2 is not None else None
+
+        # Convert once to Python lists for the pure-Python RTL model.
+        x_e4m3_list = x_e4m3.cpu().tolist()                       # [B][K]
+        w_e4m3_list = w_e4m3.cpu().tolist()                       # [O][K]
+        b_e4m3_list = b_e4m3.cpu().tolist() if b_e4m3 is not None else None
+
+        # Store model output bits in Python first, then decode once per tile.
+        y_bits = torch.zeros(batch, out_features, dtype=torch.int32, device=device)
+
+        zero_vec = [0] * vec_len
+        zero_bias = [0] * num_lanes
+        scale_list = [scale_exp] * num_lanes
 
         for out_base in range(0, out_features, num_lanes):
             lane_count = min(num_lanes, out_features - out_base)
 
             dut = InnerProductTreesModel(self.p)
 
-            # psum storage for this output tile: BF16 bits
-            psum_bits = torch.zeros(batch, num_lanes, dtype=torch.int32, device=x_q.device)
+            # psum storage for this output tile: plain Python ints
+            psum_bits = [[0] * num_lanes for _ in range(batch)]
 
-            num_k_tiles = math.ceil(in_features / vec_len)
+            # Precompute per-lane output index mapping for this tile
+            lane_out_idx = [out_base + lane for lane in range(lane_count)]
 
             for k_tile in range(num_k_tiles):
                 k0 = k_tile * vec_len
                 k1 = min(k0 + vec_len, in_features)
                 tile_width = k1 - k0
+                needs_pad = tile_width < vec_len
 
                 # Load weights into writable buffer
                 for lane in range(num_lanes):
                     if lane < lane_count:
-                        row = w_e4m3[out_base + lane, k0:k1]
-                        if tile_width < vec_len:
-                            pad = torch.zeros(vec_len - tile_width, dtype=torch.uint8, device=x_q.device)
-                            row = torch.cat([row, pad], dim=0)
+                        row = w_e4m3_list[out_base + lane][k0:k1]
+                        if needs_pad:
+                            row = row + zero_vec[tile_width:]
                     else:
-                        row = torch.zeros(vec_len, dtype=torch.uint8, device=x_q.device)
+                        row = zero_vec
 
                     dut.load_weights(
                         WeightLoadReq(
-                            weightsDma=row.tolist(),
+                            weightsDma=row,
                             laneIdx=lane,
                             last=(lane == num_lanes - 1),
                         )
                     )
 
+                # Bias behavior for this tile
+                if k_tile == 0 and b_e4m3_list is not None:
+                    bias_list = zero_bias.copy()
+                    for lane in range(lane_count):
+                        bias_list[lane] = b_e4m3_list[out_base + lane]
+                    addend_sel = AddendSel.UseBias
+                elif k_tile == 0:
+                    bias_list = zero_bias
+                    addend_sel = AddendSel.UseAct
+                else:
+                    bias_list = zero_bias
+                    addend_sel = AddendSel.UsePsum
+
                 # Compute each batch row
                 for b_idx in range(batch):
-                    act = x_e4m3[b_idx, k0:k1]
-                    if tile_width < vec_len:
-                        pad = torch.zeros(vec_len - tile_width, dtype=torch.uint8, device=x_q.device)
-                        act = torch.cat([act, pad], dim=0)
-
-                    if k_tile == 0 and b_e4m3 is not None:
-                        bias_list = torch.zeros(num_lanes, dtype=torch.uint8, device=x_q.device)
-                        bias_list[:lane_count] = b_e4m3[out_base:out_base + lane_count]
-                        addend_sel = AddendSel.UseBias
-                    elif k_tile == 0:
-                        bias_list = torch.zeros(num_lanes, dtype=torch.uint8, device=x_q.device)
-                        addend_sel = AddendSel.UseAct
-                    else:
-                        bias_list = torch.zeros(num_lanes, dtype=torch.uint8, device=x_q.device)
-                        addend_sel = AddendSel.UsePsum
+                    act = x_e4m3_list[b_idx][k0:k1]
+                    if needs_pad:
+                        act = act + zero_vec[tile_width:]
 
                     req = ComputeReq(
-                        act=act.tolist(),
-                        bias=bias_list.tolist(),
-                        psum=psum_bits[b_idx].tolist(),
-                        scaleExp=[scale_exp] * num_lanes,
+                        act=act,
+                        bias=bias_list,
+                        psum=psum_bits[b_idx],
+                        scaleExp=scale_list,
                         addendSel=addend_sel,
                         outFmtSel=self.out_fmt_sel,
                     )
 
-                    out_bits = dut.compute_now(req)
-                    psum_bits[b_idx] = torch.tensor(out_bits, dtype=torch.int32, device=x_q.device)
+                    psum_bits[b_idx] = dut.compute_now(req)
 
             # Final decode for this output tile
-            y_tile = decode_model_output_bits(psum_bits[:, :lane_count], self.out_fmt_sel)
-            y[:, out_base:out_base + lane_count] = y_tile
+            tile_bits = torch.tensor(
+                [row[:lane_count] for row in psum_bits],
+                dtype=torch.int32,
+                device=device,
+            )
+            y_bits[:, out_base:out_base + lane_count] = tile_bits
 
+        y = decode_model_output_bits(y_bits, self.out_fmt_sel)
         return y.reshape(*original_shape, out_features)
